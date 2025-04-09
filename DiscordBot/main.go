@@ -74,7 +74,7 @@ func startAPI() {
 		}
 
 		go func(wallet_address, text string) {
-            userId := utils.GetDiscordNameForWallet("rpcClient", wallet_address)
+            userId := utils.GetDiscordNameForWallet(wallet_address)
 			channel, err := discordSession.UserChannelCreate(userId)
 			if err != nil {
 				log.Panic("Failed to create DM channel: ", err)
