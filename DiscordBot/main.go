@@ -1,73 +1,120 @@
 package main
 
 import (
-	"flag"
-    "log"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+    utils "./gandalf-detector"
+
+    "github.com/gin-gonic/gin"
 	"github.com/bwmarrin/discordgo"
+    "github.com/joho/godotenv"
 )
 
-// Variables used for command line parameters
-var (
-	Token string
-)
+var discordSession *discordgo.Session
 
-func init() {
-
-	flag.StringVar(&Token, "t", "", "Bot Token")
-	flag.Parse()
-}
+// We'll store message & user IDs for matching
+var trackedMessages = make(map[string]string)
 
 func main() {
 
-	// Create a new Discord session using the provided bot token.
-	dg, err := discordgo.New("Bot " + Token)
+    err := godotenv.Load(".env")
+    if err != nil{
+        log.Panic("Error loading .env file: ", err)
+    }
+    BotToken := os.Getenv("DiscordToken")
+
+	// Initialize Discord bot
+	var err error
+	discordSession, err = discordgo.New("Bot " + BotToken)
 	if err != nil {
-		log.Panic("error creating Discord session,", err)
+		log.Fatalf("Error creating Discord session: %v", err)
 	}
 
-	// Register the messageCreate func as a callback for MessageCreate events.
-	dg.AddHandler(messageCreate)
+	discordSession.Identify.Intents = discordgo.IntentsGuildMessages |
+		discordgo.IntentsDirectMessages |
+		discordgo.IntentsGuildMessageReactions |
+		discordgo.IntentsMessageContent
 
-	// In this example, we only care about receiving message events.
-	dg.Identify.Intents = discordgo.IntentsGuildMessages
+	discordSession.AddHandler(reactionAdd)
 
-	// Open a websocket connection to Discord and begin listening.
-	err = dg.Open()
+	err = discordSession.Open()
 	if err != nil {
-		log.Panic("error opening connection,", err)
+		log.Fatalf("Error opening Discord session: %v", err)
 	}
+	fmt.Println("🤖 Discord bot is running...")
 
-	// Wait here until CTRL-C or other term signal is received.
-	fmt.Println("Bot is now running.  Press CTRL-C to exit.")
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	<-sc
+	// Start Gin server in a goroutine
+	go startAPI()
 
-	// Cleanly close down the Discord session.
-	dg.Close()
+	// Handle shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
+	<-stop
+
+	discordSession.Close()
 }
 
-// This function will be called (due to AddHandler above) every time a new
-// message is created on any channel that the authenticated bot has access to.
-func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
+// Gin API starts here
+func startAPI() {
+	r := gin.Default()
 
-	// Ignore all messages created by the bot itself
-	// This isn't required in this specific example but it's a good practice.
-	if m.Author.ID == s.State.User.ID {
-		return
-	}
-	// If the message is "ping" reply with "Pong!"
-	if m.Content == "ping" {
-		s.ChannelMessageSend(m.ChannelID, "Pong!")
-	}
+	r.POST("/", func(c *gin.Context) {
+		var req struct {
+			wallet_address string `json:"wallet_address"` // Discord user ID
+		}
 
-	// If the message is "pong" reply with "Ping!"
-	if m.Content == "pong" {
-		s.ChannelMessageSend(m.ChannelID, "Ping!")
+		if err := c.BindJSON(&req); err != nil || req.wallet_address == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		}
+
+		go func(wallet_address, text string) {
+            userId := utils.GetDiscordNameForWallet("rpcClient", wallet_address)
+			channel, err := discordSession.UserChannelCreate(userId)
+			if err != nil {
+				log.Panic("Failed to create DM channel: ", err)
+			}
+
+			message = "Please react with 👍 to confirm your recent transaction"
+
+			msg, err := discordSession.ChannelMessageSend(channel.ID, message)
+			if err != nil {
+				log.Panic("Failed to send DM: ", err)
+			}
+
+			trackedMessages[msg.ID] = userID
+
+			// Add thumbs up reaction
+			_ = discordSession.MessageReactionAdd(channel.ID, msg.ID, "👍")
+		}(req.UserID, req.Text)
+
+		c.JSON(http.StatusOK, gin.H{"status": "DM sent"})
+	})
+
+	log.Println("🚀 Gin API is running on http://localhost:8080")
+	r.Run(":8080")
+}
+
+// Reaction event
+func reactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
+	userID, ok := trackedMessages[r.MessageID]
+	if ok && r.UserID == userID && r.Emoji.Name == "👍" {
+		channel, err := s.UserChannelCreate(r.UserID)
+		if err != nil {
+			log.Printf("Error creating DM channel: %v", err)
+			return
+		}
+
+		_, _ = s.ChannelMessageSend(channel.ID, "✅ Confirmed! Taking action now...")
+
+
+		// Clean up
+		delete(trackedMessages, r.MessageID)
 	}
 }
+
